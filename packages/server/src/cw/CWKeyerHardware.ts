@@ -1,8 +1,14 @@
 import { SerialPort } from 'serialport';
+import cwKeyerPin from '@tx5dr/cw-keyer-pin';
 import type { CWKeyActiveLevel } from '@tx5dr/contracts';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('CWKeyerHardware');
+
+// Native helper that drives DTR/RTS via TIOCMBIS / TIOCMBIC (per-bit ioctls).
+// serialport 的 set() 走 TIOCMGET + TIOCMSET (整体回写)，在某些 Linux/tty
+// 驱动组合上会返回 ENOTTY (CP2105 ECI on 6.17)。原生按位 ioctl 可避开此问题。
+const nativeSetPin = typeof cwKeyerPin?.setPin === 'function' ? cwKeyerPin.setPin : null;
 
 /**
  * CW 键控硬件层 — 直接通过串口 DTR/RTS 引脚控制电台 CW KEY 输入。
@@ -168,6 +174,11 @@ export class CWKeyerHardware {
     if (!this.port) {
       return;
     }
+    // 优先走原生 TIOCMBIS / TIOCMBIC 路径。serialport 的 set() 在某些 Linux
+    // tty 驱动上会 ENOTTY (CP2105 ECI on 6.17)，原生按位 ioctl 可避开此问题。
+    if (this.tryNativeSet(signal)) {
+      return;
+    }
     await new Promise<void>((resolve, reject) => {
       this.port!.set(signal, (err) => {
         if (err) {
@@ -177,6 +188,52 @@ export class CWKeyerHardware {
         }
       });
     });
+  }
+
+  /**
+   * 当原生 addon 可用且能取到 fd 时，直接用 TIOCMBIS/TIOCMBIC 设置引脚。
+   * 返回 true 表示已处理；false 表示原生路径不可用，调用方需回退到 port.set()。
+   */
+  private tryNativeSet(signal: { dtr?: boolean; rts?: boolean }): boolean {
+    if (!nativeSetPin) {
+      return false;
+    }
+    const fd = this.getPortFd();
+    if (fd < 0) {
+      return false;
+    }
+    if (typeof signal.dtr === 'boolean') {
+      nativeSetPin(fd, 'dtr', signal.dtr);
+    }
+    if (typeof signal.rts === 'boolean') {
+      nativeSetPin(fd, 'rts', signal.rts);
+    }
+    return true;
+  }
+
+  /**
+   * 从 serialport 实例上拿底层 fd。不同 serialport 版本暴露方式不同，
+   * 这里尝试多条路径；任何一条返回有效 fd 即用，否则返回 -1 触发回退。
+   */
+  private getPortFd(): number {
+    if (!this.port) {
+      return -1;
+    }
+    const port = this.port as SerialPort & {
+      fd?: number;
+      binding?: { fd?: number } | null;
+      port?: { fd?: number } | null;
+    };
+    if (typeof port.fd === 'number' && port.fd >= 0) {
+      return port.fd;
+    }
+    if (typeof port.binding?.fd === 'number' && port.binding.fd >= 0) {
+      return port.binding.fd;
+    }
+    if (typeof port.port?.fd === 'number' && port.port.fd >= 0) {
+      return port.port.fd;
+    }
+    return -1;
   }
 
   private async closePortBestEffort(port: SerialPort | null): Promise<void> {

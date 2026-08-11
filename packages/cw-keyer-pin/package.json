@@ -1,0 +1,16 @@
+{
+  "name": "@tx5dr/cw-keyer-pin",
+  "version": "1.0.0",
+  "description": "Native N-API addon for direct DTR/RTS pin control via TIOCMBIS/TIOCMBIC. Works around @serialport/bindings-cpp TIOCMSET ENOTTY failures on certain Linux/tty drivers (notably CP2105 ECI on kernel 6.17).",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "postinstall": "node -e \"if(process.platform==='linux'){const r=require('child_process').spawnSync('node-gyp',['rebuild'],{stdio:'inherit',shell:true});if(r.status!==0)console.warn('@tx5dr/cw-keyer-pin: native build failed; falling back to serialport.set().')}else{console.log('@tx5dr/cw-keyer-pin: skipping native build on '+process.platform)}\""
+  },
+  "devDependencies": {
+    "node-gyp": "^11.2.0"
+  },
+  "license": "MIT",
+  "private": true
+}

@@ -6485,6 +6485,14 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"@tx5dr/cw-keyer-pin@workspace:*, @tx5dr/cw-keyer-pin@workspace:packages/cw-keyer-pin":
+  version: 0.0.0-use.local
+  resolution: "@tx5dr/cw-keyer-pin@workspace:packages/cw-keyer-pin"
+  dependencies:
+    node-gyp: "npm:^11.2.0"
+  languageName: unknown
+  linkType: soft
+
 "@tx5dr/electron-main@workspace:packages/electron-main":
   version: 0.0.0-use.local
   resolution: "@tx5dr/electron-main@workspace:packages/electron-main"
@@ -6556,6 +6564,7 @@ __metadata:
     "@tx5dr/builtin-plugins": "workspace:*"
     "@tx5dr/contracts": "workspace:*"
     "@tx5dr/core": "workspace:*"
+    "@tx5dr/cw-keyer-pin": "workspace:*"
     "@tx5dr/plugin-api": "workspace:*"
     "@tx5dr/rigctld-server": "workspace:*"
     "@tx5dr/shared-config": "workspace:*"

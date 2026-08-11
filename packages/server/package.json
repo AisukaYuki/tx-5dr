@@ -32,6 +32,7 @@
     "@tx5dr/builtin-plugins": "workspace:*",
     "@tx5dr/contracts": "workspace:*",
     "@tx5dr/core": "workspace:*",
+    "@tx5dr/cw-keyer-pin": "workspace:*",
     "@tx5dr/plugin-api": "workspace:*",
     "@tx5dr/rigctld-server": "workspace:*",
     "@types/wav": "^1.0.4",

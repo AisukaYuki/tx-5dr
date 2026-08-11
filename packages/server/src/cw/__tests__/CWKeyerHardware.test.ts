@@ -62,6 +62,11 @@ vi.mock('serialport', () => {
   return { SerialPort };
 });
 
+// Mock the native addon to an empty binding so CWKeyerHardware falls back to
+// serialport's port.set() path. This keeps the existing port.set()-based
+// assertions valid on platforms where the native addon is unavailable.
+vi.mock('@tx5dr/cw-keyer-pin', () => ({ default: {} }));
+
 function resetSerialPortMock(): void {
   serialPortMock.instances.length = 0;
   serialPortMock.openError = null;
