@@ -12,21 +12,39 @@ import {
   type UpdateSelfLoginCredentialRequest,
   type UpdateTokenRequest,
   type UpdateAuthConfigRequest,
+  type UpdateRemoteAccessSecurityRequest,
   type PermissionGrant,
   UserRole,
   USER_ROLE_LEVEL,
   AuthConfigSchema,
+  isSecureRemoteAccessOrigin,
+  normalizeRemoteAccessOrigin,
+  RemoteAccessSecurityConfigSchema,
 } from '@tx5dr/contracts';
 import { getConfigFilePath } from '../utils/app-paths.js';
 import { createLogger } from '../utils/logger.js';
 import { JsonFileStore, PersistenceCoordinator, safeWriteFile } from '../utils/persistence/index.js';
 import { RuntimeStateManager } from '../config/RuntimeStateManager.js';
+import {
+  BrowserLoginCodeStore,
+  type CreatedBrowserLoginCode,
+} from './BrowserLoginCodeStore.js';
+import { registerSensitiveLogValue } from '../utils/sensitive-log.js';
 
 const logger = createLogger('AuthManager');
 
 const BCRYPT_ROUNDS = 10;
 const TOKEN_PREFIX = 'txdr_';
 const TOKEN_BYTES = 32;
+
+export interface BrowserLoginIdentity {
+  tokenId: string;
+  role: UserRole;
+  label: string;
+  operatorIds: string[];
+  maxOperators?: number;
+  permissionGrants?: PermissionGrant[];
+}
 
 export class AuthManagerError extends Error {
   constructor(public readonly code: string, message?: string) {
@@ -42,6 +60,7 @@ export class AuthManager {
   private jwtSecret!: string;
   private configStore: JsonFileStore<AuthConfig> | null = null;
   private runtimeState = RuntimeStateManager.getInstance();
+  private browserLoginCodes = new BrowserLoginCodeStore();
   private unregisterPersistence: (() => void) | null = null;
 
   private constructor() {}
@@ -63,6 +82,7 @@ export class AuthManager {
     }
     await this.loadConfig();
     await this.ensureJwtSecret();
+    this.browserLoginCodes.clear();
     await this.ensureInitialAdminToken();
     this.unregisterPersistence?.();
     this.unregisterPersistence = PersistenceCoordinator.getInstance().register({
@@ -74,12 +94,52 @@ export class AuthManager {
   // ===== 配置持久化 =====
 
   private async loadConfig(): Promise<void> {
+    let legacyConfigWithoutPublicViewerField = false;
+    let isNewElectronInstallation = false;
+    try {
+      const raw = JSON.parse(await fs.readFile(this.configPath, 'utf-8')) as Record<string, unknown>;
+      // Only migrate a structurally valid legacy file. A corrupt file must not
+      // turn public viewing on while JsonFileStore falls back to safe defaults.
+      AuthConfigSchema.parse(raw);
+      legacyConfigWithoutPublicViewerField = !Object.prototype.hasOwnProperty.call(raw, 'allowPublicViewing');
+    } catch (error) {
+      // A missing file is a new installation and must use the secure default.
+      isNewElectronInstallation = (error as NodeJS.ErrnoException).code === 'ENOENT'
+        && process.env.TX5DR_RUNTIME_MANAGEMENT === 'electron';
+    }
     this.configStore = new JsonFileStore<AuthConfig>(this.configPath, {
       defaultValue: () => AuthConfigSchema.parse({}),
       validate: (value) => AuthConfigSchema.parse(value),
       backups: 3,
     });
     this.config = await this.configStore.load();
+    if (isNewElectronInstallation) {
+      this.config.remoteAccess = RemoteAccessSecurityConfigSchema.parse({
+        preset: 'local',
+        maxConnections: 8,
+        maxConnectionsPerIp: 8,
+        maxPendingAuth: 8,
+      });
+      await this.saveConfig({ internal: true });
+    }
+    // Server deployments are always reachable through an external web entrypoint.
+    // A persisted local preset from an older build cannot make nginx, Docker, or
+    // the Android bridge loopback-only, so migrate it to the honest LAN preset.
+    if (process.env.TX5DR_RUNTIME_MANAGEMENT !== 'electron' && this.config.remoteAccess.preset === 'local') {
+      this.config.remoteAccess = RemoteAccessSecurityConfigSchema.parse({
+        ...this.config.remoteAccess,
+        preset: 'lan',
+        maxConnections: 32,
+        maxConnectionsPerIp: 16,
+        maxPendingAuth: 32,
+      });
+      await this.saveConfig({ internal: true });
+    }
+    if (legacyConfigWithoutPublicViewerField) {
+      this.config.allowPublicViewing = true;
+      await this.saveConfig({ internal: true });
+      logger.info('Migrated legacy public viewer default without changing effective access');
+    }
   }
 
   private async saveConfig(options: { defer?: boolean; internal?: boolean } = {}): Promise<void> {
@@ -118,6 +178,14 @@ export class AuthManager {
     }
 
     if (plainToken) {
+      registerSensitiveLogValue(plainToken);
+      if (process.platform !== 'win32') {
+        try {
+          await fs.chmod(this.adminTokenFilePath, 0o600);
+        } catch (error) {
+          logger.warn('Failed to restrict .admin-token permissions', error);
+        }
+      }
       // 文件中有 token，检查是否已注册到 auth.json
       const existing = await this.findTokenByPlainText(plainToken);
       if (!existing) {
@@ -151,18 +219,13 @@ export class AuthManager {
         maxOperators: 0,
       }, null, undefined, true);
       plainToken = result.token;
+      registerSensitiveLogValue(plainToken);
       // 写入 .admin-token 文件供 Electron 等外部进程读取
       await safeWriteFile(this.adminTokenFilePath, plainToken, { backups: 1, mode: 0o600 });
       logger.info('Admin token generated and written to .admin-token file');
     }
 
-    // 每次启动都打印管理员令牌
-    logger.info('');
-    logger.info('╔══════════════════════════════════════════════════╗');
-    logger.info('║  Admin token:                                    ║');
-    logger.info(`║  ${plainToken}`);
-    logger.info('╚══════════════════════════════════════════════════╝');
-    logger.info('');
+    logger.info('Admin token file is ready');
   }
 
   // ===== Token CRUD =====
@@ -357,6 +420,7 @@ export class AuthManager {
     if (!token || !token.system) return null;
 
     const newPlainToken = this.generateToken();
+    registerSensitiveLogValue(newPlainToken);
     const newHash = await bcrypt.hash(newPlainToken, BCRYPT_ROUNDS);
 
     token.tokenHash = newHash;
@@ -496,6 +560,37 @@ export class AuthManager {
     return { role: token.role, operatorIds: token.operatorIds, maxOperators: token.maxOperators, permissionGrants: token.permissionGrants };
   }
 
+  createBrowserLoginCode(tokenId: string): CreatedBrowserLoginCode {
+    if (!this.isAuthEnabled()) {
+      throw new AuthManagerError('AUTH_DISABLED', 'Authentication is disabled');
+    }
+
+    const token = this.config.tokens.find(t => t.id === tokenId);
+    if (!token || !this.isTokenStillValid(tokenId) || token.role !== UserRole.ADMIN) {
+      throw new AuthManagerError('FORBIDDEN', 'Administrator authentication is required');
+    }
+
+    return this.browserLoginCodes.create(tokenId);
+  }
+
+  consumeBrowserLoginCode(code: string): BrowserLoginIdentity | null {
+    const record = this.browserLoginCodes.consume(code);
+    if (!record || !this.isAuthEnabled() || !this.isTokenStillValid(record.issuerTokenId)) {
+      return null;
+    }
+
+    const token = this.config.tokens.find(t => t.id === record.issuerTokenId);
+    if (!token || token.role !== UserRole.ADMIN) return null;
+    return {
+      tokenId: token.id,
+      role: token.role,
+      label: token.label,
+      operatorIds: [...token.operatorIds],
+      maxOperators: token.maxOperators,
+      permissionGrants: token.permissionGrants,
+    };
+  }
+
   // ===== 认证配置 =====
 
   isAuthEnabled(): boolean {
@@ -509,6 +604,55 @@ export class AuthManager {
   getAuthConfig() {
     return {
       enabled: this.isAuthEnabled(),
+      allowPublicViewing: this.config.allowPublicViewing,
+    };
+  }
+
+  getRemoteAccessConfig() {
+    return this.config?.remoteAccess ?? RemoteAccessSecurityConfigSchema.parse({});
+  }
+
+  async updateRemoteAccessConfig(updates: UpdateRemoteAccessSecurityRequest) {
+    const { allowPublicViewing, ...securityUpdates } = updates;
+    const requestedPreset = securityUpdates.preset === 'local'
+      && process.env.TX5DR_RUNTIME_MANAGEMENT !== 'electron'
+      ? 'lan'
+      : securityUpdates.preset;
+    const effectiveSecurityUpdates = requestedPreset
+      ? { ...securityUpdates, preset: requestedPreset }
+      : securityUpdates;
+    const presetDefaults = effectiveSecurityUpdates.preset
+      ? {
+          local: { maxConnections: 8, maxConnectionsPerIp: 8, maxPendingAuth: 8 },
+          lan: { maxConnections: 32, maxConnectionsPerIp: 16, maxPendingAuth: 32 },
+          public: { maxConnections: 128, maxConnectionsPerIp: 32, maxPendingAuth: 32 },
+        }[effectiveSecurityUpdates.preset]
+      : {};
+    const nextRemoteAccess = RemoteAccessSecurityConfigSchema.parse({
+      ...this.config.remoteAccess,
+      ...presetDefaults,
+      ...effectiveSecurityUpdates,
+    });
+    if (nextRemoteAccess.preset === 'public') {
+      const normalizedOrigins = [...new Set(nextRemoteAccess.allowedOrigins.flatMap(value => {
+        const normalized = normalizeRemoteAccessOrigin(value);
+        return normalized ? [normalized] : [];
+      }))];
+      if (normalizedOrigins.length === 0) {
+        throw new AuthManagerError('PUBLIC_ORIGIN_REQUIRED', 'Managed public deployment requires at least one allowed web origin');
+      }
+      if (nextRemoteAccess.allowedOrigins.some(value => !isSecureRemoteAccessOrigin(value))) {
+        throw new AuthManagerError('PUBLIC_ORIGIN_INSECURE', 'Public web origins must use HTTPS; HTTP is limited to private or loopback addresses');
+      }
+      nextRemoteAccess.allowedOrigins = normalizedOrigins;
+    }
+    this.config.remoteAccess = nextRemoteAccess;
+    if (allowPublicViewing !== undefined) {
+      this.config.allowPublicViewing = allowPublicViewing;
+    }
+    await this.saveConfig();
+    return {
+      ...this.config.remoteAccess,
       allowPublicViewing: this.config.allowPublicViewing,
     };
   }
