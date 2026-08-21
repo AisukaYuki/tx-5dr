@@ -149,6 +149,10 @@ export interface AppConfig {
     servers?: string[];
     autoApplyOffset?: boolean;
   };
+  observability: {
+    enabled: boolean;
+    noticeVersion: number;
+  };
 }
 
 // 音频处理配置接口
@@ -165,6 +169,8 @@ export interface AudioConfig {
   outputSampleRate?: number;
   inputBufferSize?: number;
   outputBufferSize?: number;
+  inputSignalType?: AudioDeviceSettings['inputSignalType'];
+  ifCenterHz?: number;
   sampleRate?: number;
   bufferSize?: number;
 }
@@ -212,6 +218,10 @@ const DEFAULT_CONFIG: AppConfig = {
   rtcDataAudioPublicUdpPort: null,
   rigctld: { ...DEFAULT_RIGCTLD_BRIDGE_CONFIG },
   cwDecoder: CWDecoderConfigSchema.parse({}),
+  observability: {
+    enabled: true,
+    noticeVersion: 0,
+  },
 };
 
 // 默认音频配置（无 Profile 时的兜底值）
@@ -222,11 +232,17 @@ const DEFAULT_AUDIO: AudioDeviceSettings = {
   outputBufferSize: 1024,
   outputSampleFormat: 'float32',
   outputChannelMode: 'mono',
+  inputSignalType: 'af',
+  ifCenterHz: 12000,
 };
 
 export function normalizeAudioDeviceSettings(audioConfig?: Partial<AudioDeviceSettings> | null): AudioDeviceSettings {
   const legacySampleRate = audioConfig?.sampleRate;
   const legacyBufferSize = audioConfig?.bufferSize;
+  const inputSignalType = audioConfig?.inputSignalType === 'icom-12k-if' ? 'icom-12k-if' : 'af';
+  const ifCenterHz = Number.isFinite(audioConfig?.ifCenterHz)
+    ? Math.min(24000, Math.max(1, Number(audioConfig?.ifCenterHz)))
+    : 12000;
 
   return {
     inputDeviceName: audioConfig?.inputDeviceName,
@@ -243,6 +259,8 @@ export function normalizeAudioDeviceSettings(audioConfig?: Partial<AudioDeviceSe
     outputBufferSize: audioConfig?.outputBufferSize ?? legacyBufferSize ?? 1024,
     outputSampleFormat: audioConfig?.outputSampleFormat ?? 'float32',
     outputChannelMode: audioConfig?.outputChannelMode ?? 'mono',
+    inputSignalType,
+    ifCenterHz,
   };
 }
 
@@ -301,6 +319,7 @@ export function validateAppConfigCandidate(value: unknown): Record<string, unkno
   assertOptionalObject(value, 'rigctld');
   assertOptionalObject(value, 'cwDecoder');
   assertOptionalObject(value, 'ntp');
+  assertOptionalObject(value, 'observability');
   assertOptionalObjectOrNull(value, 'lastSelectedFrequency');
   assertOptionalObjectOrNull(value, 'lastVoiceFrequency');
   assertOptionalObjectOrNull(value, 'lastCWFrequency');
@@ -315,6 +334,17 @@ export function validateAppConfigCandidate(value: unknown): Record<string, unkno
   }
   if (value.logLevel !== undefined && !['debug', 'info', 'warn', 'error'].includes(String(value.logLevel))) {
     throw new Error('config.logLevel must be debug, info, warn, or error');
+  }
+  if (isPlainObject(value.observability)) {
+    if (value.observability.enabled !== undefined && typeof value.observability.enabled !== 'boolean') {
+      throw new Error('config.observability.enabled must be a boolean');
+    }
+    if (
+      value.observability.noticeVersion !== undefined
+      && (!Number.isInteger(value.observability.noticeVersion) || Number(value.observability.noticeVersion) < 0)
+    ) {
+      throw new Error('config.observability.noticeVersion must be a non-negative integer');
+    }
   }
 
   if (isPlainObject(value.ft8)) {
@@ -817,7 +847,10 @@ export class ConfigManager {
    * 添加 Profile
    */
   async addProfile(profile: RadioProfile): Promise<void> {
-    this.config.profiles.push(profile);
+    this.config.profiles.push({
+      ...profile,
+      radio: normalizeHamlibConfig(profile.radio),
+    });
     await this.saveConfig();
   }
 
@@ -865,6 +898,12 @@ export class ConfigManager {
       nextUpdates = {
         ...nextUpdates,
         audio: normalizeAudioDeviceSettings({ ...existing.audio, ...nextAudio }),
+      };
+    }
+    if (updates.radio) {
+      nextUpdates = {
+        ...nextUpdates,
+        radio: normalizeHamlibConfig({ ...existing.radio, ...updates.radio }),
       };
     }
 
@@ -987,6 +1026,14 @@ export class ConfigManager {
       throw new Error('config.logLevel must be debug, info, warn, or error');
     }
     this.config.logLevel = level;
+    await this.saveConfig();
+  }
+
+  async updateObservabilitySettings(settings: AppConfig['observability']): Promise<void> {
+    if (!Number.isInteger(settings.noticeVersion) || settings.noticeVersion < 0) {
+      throw new Error('config.observability.noticeVersion must be a non-negative integer');
+    }
+    this.config.observability = { ...settings };
     await this.saveConfig();
   }
 

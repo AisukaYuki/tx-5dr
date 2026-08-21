@@ -277,7 +277,7 @@ export const HamlibConfigSchema = z.object({
   // Hamlib 频谱配置（当前仅用于官方频谱流 speed）
   spectrum: HamlibSpectrumConfigSchema.optional(),
 
-  // FT8/FT4 切换频率时是否主动设置电台 CAT 模式；未设置按 none 处理
+  // FT8/FT4 切换频率时是否主动设置电台 CAT 模式；未设置时按 none 处理
   digitalModeRadioMode: DigitalModeRadioModePreferenceSchema.optional(),
 
   // 发射时序补偿（毫秒）- 用于补偿电台和网络的处理延迟

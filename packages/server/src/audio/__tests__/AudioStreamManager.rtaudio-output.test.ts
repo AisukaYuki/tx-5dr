@@ -123,6 +123,10 @@ const { mockConfigManager, mockLogger, mockResampleAudioProfessional, mockRtAudi
     emitRtAudioError(type: number, message: string) {
       this.errorCallback?.(type, message);
     }
+
+    consumeNextFrame() {
+      this.frameOutputCallback?.();
+    }
   }
 
   return {
@@ -159,7 +163,13 @@ vi.mock('../../utils/logger.js', () => ({
   createLogger: () => mockLogger,
 }));
 
-import { AudioStreamManager, getAudioRuntimeIssue, isRtAudioRuntimeLossMessage } from '../AudioStreamManager.js';
+import {
+  AudioRuntimeIssueError,
+  AudioStreamManager,
+  getAudioRuntimeIssue,
+  isRtAudioRuntimeLossMessage,
+  type RtAudioRuntimeIssue,
+} from '../AudioStreamManager.js';
 import { AudioDeviceManager } from '../audio-device-manager.js';
 import { RingBuffer } from '../ringBuffer.js';
 
@@ -386,24 +396,97 @@ describe('AudioStreamManager RtAudio output diagnostics', () => {
     manager.on('error', (error) => runtimeErrors.push(error));
     await manager.startOutput();
 
-    await manager.playAudio(new Float32Array(256).fill(0.5), 48000);
+    await expect(manager.playAudio(new Float32Array(256).fill(0.5), 48000))
+      .rejects.toMatchObject({
+        audioIssue: expect.objectContaining({
+          kind: 'consumption-stall',
+          disposition: 'restart-required',
+        }),
+      });
 
     expect(runtimeErrors.some((error) => error.message.includes('submitted audio but no frame consumption'))).toBe(true);
     expect(mockLogger.error).toHaveBeenCalledWith(
-      'Windows RtAudio output consume watchdog fired',
+      'RtAudio output consume watchdog fired',
       expect.objectContaining({
         submittedChunks: 4,
         consumedChunks: 0,
       }),
     );
-    expect(mockLogger.warn).toHaveBeenCalledWith(
-      'RtAudio output did not consume all submitted playback chunks before timeout',
-      expect.objectContaining({
-        submittedChunks: 4,
-        consumedChunks: 0,
-        consumeComplete: false,
-      }),
-    );
+  });
+
+  it('acknowledges RtAudio playback only after the device consumes a frame', async () => {
+    mockRtAudioState.consumeOnWrite = false;
+    const manager = new AudioStreamManager();
+    const onPlaybackStarted = vi.fn();
+    await manager.startOutput();
+
+    const playback = manager.playAudio(new Float32Array(256).fill(0.5), 48000, { onPlaybackStarted });
+    await vi.waitFor(() => expect(mockRtAudioState.writes.length).toBeGreaterThan(0));
+    expect(onPlaybackStarted).not.toHaveBeenCalled();
+
+    const output = (manager as unknown as { rtAudioOutput: { consumeNextFrame: () => void } }).rtAudioOutput;
+    output.consumeNextFrame();
+    expect(onPlaybackStarted).toHaveBeenCalledTimes(1);
+    await playback;
+  });
+
+  it('does not enqueue a new RtAudio playback behind undrained output', async () => {
+    mockRtAudioState.consumeOnWrite = false;
+    const manager = new AudioStreamManager();
+    await manager.startOutput();
+
+    await manager.playAudio(new Float32Array(256).fill(0.5), 48000);
+
+    await expect(manager.playAudio(new Float32Array(256).fill(0.5), 48000))
+      .rejects.toThrow('undrained audio from a previous playback');
+  });
+
+  it('waits for every previously submitted RtAudio chunk before allowing replacement playback', async () => {
+    mockRtAudioState.consumeOnWrite = false;
+    const manager = new AudioStreamManager();
+    await manager.startOutput();
+    await manager.playAudio(new Float32Array(256).fill(0.5), 48000);
+
+    let drained = false;
+    const drain = manager.waitForOutputDrain({ timeoutMs: 200 }).then((waited) => {
+      drained = true;
+      return waited;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+
+    const output = (manager as unknown as {
+      rtAudioOutput: { consumeNextFrame: () => void };
+    }).rtAudioOutput;
+    for (let index = 0; index < mockRtAudioState.writes.length; index++) {
+      output.consumeNextFrame();
+    }
+
+    await expect(drain).resolves.toBe(true);
+    mockRtAudioState.consumeOnWrite = true;
+    await expect(manager.playAudio(new Float32Array(256).fill(0.25), 48000)).resolves.toBeUndefined();
+  });
+
+  it('bounds waiting for an RtAudio FIFO that never drains', async () => {
+    mockRtAudioState.consumeOnWrite = false;
+    const manager = new AudioStreamManager();
+    await manager.startOutput();
+    await manager.playAudio(new Float32Array(256).fill(0.5), 48000);
+
+    await expect(manager.waitForOutputDrain({ timeoutMs: 10 }))
+      .rejects.toThrow('RtAudio output drain timed out after 10ms');
+  });
+
+  it('rejects an output-drain waiter when the RtAudio stream is stopped', async () => {
+    mockRtAudioState.consumeOnWrite = false;
+    const manager = new AudioStreamManager();
+    await manager.startOutput();
+    await manager.playAudio(new Float32Array(256).fill(0.5), 48000);
+
+    const drain = expect(manager.waitForOutputDrain({ timeoutMs: 200 }))
+      .rejects.toThrow('output stopped before previous playback drained');
+    await manager.stopOutput();
+    await drain;
   });
 
   it('surfaces RtAudio output error callbacks through AudioStreamManager error events', async () => {
@@ -473,6 +556,84 @@ describe('AudioStreamManager RtAudio output diagnostics', () => {
     );
   });
 
+  it('keeps legacy ALSA positive short-write warnings on the current stream', async () => {
+    const manager = new AudioStreamManager();
+    const runtimeErrors: Error[] = [];
+    manager.on('error', (error) => runtimeErrors.push(error));
+    await manager.startOutput();
+
+    const output = (manager as unknown as {
+      rtAudioOutput: { emitRtAudioError: (type: number, message: string) => void };
+    }).rtAudioOutput;
+    output.emitRtAudioError(1, 'RtApiAlsa::callbackEvent: audio write error, Unknown error 256.');
+
+    expect(runtimeErrors).toEqual([]);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      'RtAudio output callback warning',
+      expect.objectContaining({
+        kind: 'short-write',
+        disposition: 'continue',
+        fatal: false,
+      }),
+    );
+    await expect(manager.prepareAudioPlayback('digital')).resolves.toMatchObject({ ready: true });
+  });
+
+  it('does not report a virtual output ready after its stream generation failed', () => {
+    const manager = new AudioStreamManager();
+    const issue: RtAudioRuntimeIssue = {
+      issueId: 'issue-android-loss',
+      streamGeneration: 7,
+      kind: 'device-loss',
+      disposition: 'restart-required',
+      phase: 'runtime',
+      direction: 'output',
+      deviceName: 'Android audio output',
+      backend: 'android-bridge',
+      message: 'Android audio output socket closed unexpectedly',
+      sampleRate: 48000,
+      bufferSize: 512,
+      elapsedSinceOpenMs: null,
+      framesConsumed: 0,
+      fatal: true,
+      runtimeLoss: true,
+      at: Date.now(),
+    };
+    Object.assign(manager as any, {
+      isOutputting: true,
+      usingAndroidOutput: true,
+      outputStreamGeneration: 7,
+      outputRuntimeIssueError: new AudioRuntimeIssueError(issue),
+    });
+
+    expect(manager.getAudioPlaybackReadiness('digital')).toMatchObject({
+      ready: false,
+      streamGeneration: 7,
+      issue: { issueId: 'issue-android-loss', disposition: 'restart-required' },
+    });
+  });
+
+  it('ignores a fatal callback from an output stream generation that was already replaced', async () => {
+    const manager = new AudioStreamManager();
+    const runtimeErrors: Error[] = [];
+    manager.on('error', (error) => runtimeErrors.push(error));
+    await manager.startOutput();
+    const oldOutput = (manager as unknown as {
+      rtAudioOutput: { emitRtAudioError: (type: number, message: string) => void };
+    }).rtAudioOutput;
+
+    await manager.stopOutput();
+    await manager.startOutput();
+    oldOutput.emitRtAudioError(5, 'RtApiCore: the stream device was disconnected (and closed)!');
+
+    expect(runtimeErrors).toEqual([]);
+    expect(manager.getAudioPlaybackReadiness('digital')).toMatchObject({ ready: true });
+    expect(mockLogger.debug).toHaveBeenCalledWith(
+      'Ignoring stale RtAudio output callback',
+      expect.objectContaining({ type: 5 }),
+    );
+  });
+
   it('classifies CoreAudio disconnected callbacks as structured runtime loss', async () => {
     mockRtAudioState.devices = [
       {
@@ -519,6 +680,7 @@ describe('AudioStreamManager RtAudio output diagnostics', () => {
     expect(isRtAudioRuntimeLossMessage('RtApiCore: the stream device was disconnected (and closed)!')).toBe(true);
     expect(isRtAudioRuntimeLossMessage('RtApiWasapi::closeStream: No open stream to close.')).toBe(false);
     expect(isRtAudioRuntimeLossMessage('RtApiAlsa::callbackEvent: audio write error, underrun.')).toBe(false);
+    expect(isRtAudioRuntimeLossMessage('RtApiAlsa::callbackEvent: audio write error, Unknown error 256.')).toBe(false);
   });
 
   it('treats Android bridge ALSA output underruns as non-fatal warnings', async () => {
@@ -636,6 +798,29 @@ describe('AudioStreamManager RtAudio output diagnostics', () => {
         fails: expect.any(Number),
       }),
     );
+  });
+
+  it('fails playback after bounded consecutive RtAudio write errors without acknowledging start', async () => {
+    mockRtAudioState.throwOnWrite = true;
+    const manager = new AudioStreamManager();
+    await manager.startOutput();
+    const onPlaybackStarted = vi.fn();
+
+    const failure = await manager.playAudio(
+      new Float32Array(256).fill(0.5),
+      48000,
+      { onPlaybackStarted },
+    ).catch((error) => error);
+
+    expect(failure).toBeInstanceOf(AudioRuntimeIssueError);
+    expect(getAudioRuntimeIssue(failure)).toMatchObject({
+      kind: 'driver-failure',
+      disposition: 'restart-required',
+      direction: 'output',
+    });
+    expect(failure.message).toContain('20 consecutive times');
+    expect(onPlaybackStarted).not.toHaveBeenCalled();
+    expect(manager.isPlaying()).toBe(false);
   });
 
   it('logs sliding-window eviction at debug (not warn) for the RX/input buffer', () => {
